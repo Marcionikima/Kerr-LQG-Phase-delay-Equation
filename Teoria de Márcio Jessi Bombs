@@ -1,0 +1,190 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+
+# ===========================================================================
+# 1. PARÂMETROS GLOBAIS & FÍSICOS (Sgr A*)
+# ===========================================================================
+C = 3.0e8
+G = 6.674e-11
+M_SUN = 1.989e30
+M_SGRA = 4.297e6 * M_SUN
+R_S = 2 * G * M_SGRA / C**2          
+ELL_P = 1.616e-35                    
+A_STAR = 0.90                        
+GAMMA_TRUE = 0.2375
+A_COEFF = 2 * R_S / C                 
+LINEAR_REGIME_CUTOFF_ABS = 0.3
+
+# ===========================================================================
+# 2. MÓDULO DE FÍSICA E SIMULAÇÃO
+# ===========================================================================
+def f_theta(theta):
+    return np.sqrt(1 - A_STAR**2 * np.cos(theta)**2)
+
+def delta_t_true(gamma, theta):
+    return A_COEFF * np.log(2 * R_S**2 / (np.sqrt(3) * gamma * ELL_P**2)) * f_theta(theta)
+
+def simulate_data(N, sigma_t_seconds, theta, seed=42):
+    rng = np.random.default_rng(seed)
+    dt_true_val = delta_t_true(GAMMA_TRUE, theta)
+    dt_obs = rng.normal(dt_true_val, sigma_t_seconds, size=N)   
+
+    u_obs = dt_obs / (A_COEFF * f_theta(theta))                  
+    C_val = 2 * R_S**2 / (np.sqrt(3) * ELL_P**2)
+    gamma_hat_i = C_val / np.exp(u_obs)                          
+
+    sigma_u = sigma_t_seconds / (A_COEFF * f_theta(theta))
+    sigma_gamma_delta = gamma_hat_i * sigma_u                    
+    chi2 = ((dt_obs - dt_true_val) / sigma_t_seconds) ** 2       
+    pull = (gamma_hat_i - GAMMA_TRUE) / sigma_gamma_delta
+
+    return pd.DataFrame({
+        "dt_obs_s": dt_obs, "gamma_hat_i": gamma_hat_i,
+        "sigma_i": sigma_gamma_delta, "pull": pull, "chi2": chi2,
+    })
+
+def evaluate_metrics(df, sigma_t_seconds, theta, seed=1042):
+    rng = np.random.default_rng(seed)
+    N = len(df)
+    sigma_u = sigma_t_seconds / (A_COEFF * f_theta(theta))
+    
+    mean_est = df["gamma_hat_i"].mean()
+    C_val = 2 * R_S**2 / (np.sqrt(3) * ELL_P**2)
+    u_median = np.median(df["dt_obs_s"]) / (A_COEFF * f_theta(theta))
+    median_est = C_val / np.exp(u_median)
+
+    # Bootstrap para Erro Padrão (SE)
+    boot_means, boot_medians = [], []
+    idx = np.arange(N)
+    for _ in range(1000):
+        bidx = rng.choice(idx, size=N, replace=True)
+        b = df.iloc[bidx]
+        boot_means.append(b["gamma_hat_i"].mean())
+        u_m = np.median(b["dt_obs_s"]) / (A_COEFF * f_theta(theta))
+        boot_medians.append(C_val / np.exp(u_m))
+
+    return {
+        "N": N, "sigma_t_s": sigma_t_seconds,
+        "linear_regime": "SIM" if sigma_u < LINEAR_REGIME_CUTOFF_ABS else "NÃO",
+        "bias_mean": mean_est - GAMMA_TRUE, "bias_mean_SE": np.std(boot_means, ddof=1),
+        "bias_median": median_est - GAMMA_TRUE, "bias_median_SE": np.std(boot_medians, ddof=1),
+        "chi2_dof": df["chi2"].mean(), "coverage": (np.abs(df["pull"]) < 1.0).mean()
+    }
+
+# ===========================================================================
+# 3. MÓDULO DE GERAÇÃO DE GRÁFICOS
+# ===========================================================================
+def generate_pipeline_chart(df, filename="pipeline_chart.png"):
+    plt.figure(figsize=(7, 3.5))
+    plt.hist(df['gamma_hat_i'], bins=15, alpha=0.6, color='#2b5c8f', edgecolor='black', label='Recuperado ($\hat{\gamma}$)')
+    plt.axvline(GAMMA_TRUE, color='red', linestyle='--', linewidth=2, label=f'Injetado Real ({GAMMA_TRUE})')
+    plt.title("Distribuição Estatística do Parâmetro Gamma Recuperado", fontsize=11, fontweight='bold')
+    plt.xlabel("Valor de Gamma ($\gamma$)", fontsize=9)
+    plt.ylabel("Frequência (Contagem)", fontsize=9)
+    plt.legend(frameon=True, facecolor='#f4f4f4')
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300)
+    plt.close()
+
+# ===========================================================================
+# 4. GERADOR DO RELATÓRIO PDF (ReportLab)
+# ===========================================================================
+def generate_pdf_report(metrics_list, chart_path, pdf_filename="Relatorio_Psi_Echo_LQC.pdf"):
+    doc = SimpleDocTemplate(pdf_filename, pagesize=letter, leftMargin=40, rightMargin=40, topMargin=40, bottomMargin=40)
+    styles = getSampleStyleSheet()
+    story = []
+
+    # Estilos customizados
+    title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], fontSize=20, leading=24, textColor=colors.HexColor('#1a365d'), spaceAfter=15)
+    subtitle_style = ParagraphStyle('SubTitleStyle', parent=styles['Normal'], fontSize=10, leading=14, textColor=colors.HexColor('#4a5568'), spaceAfter=20)
+    h2_style = ParagraphStyle('H2Style', parent=styles['Heading2'], fontSize=14, leading=18, textColor=colors.HexColor('#2b6cb0'), spaceBefore=12, spaceAfter=8)
+    body_style = ParagraphStyle('BodyStyle', parent=styles['Normal'], fontSize=10, leading=14, spaceAfter=8)
+
+    # Cabeçalho
+    story.append(Paragraph("Relatório Técnico: Validação do Modelo Psi_Echo (LQC)", title_style))
+    story.append(Paragraph("<b>Status do Pipeline:</b> Executado com Sucesso | <b>Alvo:</b> Sgr A* (Buraco Negro Central)", subtitle_style))
+    story.append(Spacer(1, 10))
+
+    # Resumo Executivo
+    story.append(Paragraph("Resumo do Experimento", h2_style))
+    desc_text = ("Este documento consolida o teste estatístico de recuperação do parâmetro quântico gama (<b>&gamma;_true = 0.2375</b>) "
+                 "a partir do atraso de fase de ecos gravitacionais simulados. O canal de amplitude foi matematicamente descartado "
+                 "do pipeline por apresentar supressão extrema (~10^-91), tornando-se indetectável sob qualquer precisão numérica real.")
+    story.append(Paragraph(desc_text, body_style))
+    story.append(Spacer(1, 10))
+
+    # Tabela de Métricas
+    story.append(Paragraph("Métricas Estatísticas por Cenário", h2_style))
+    table_data = [["Config", "N", "Sigma_t (s)", "Reg. Linear?", "Viés Média", "Viés Mediana", "Chi² / DoF"]]
+    
+    for m in metrics_list:
+        table_data.append([
+            f"Config_N{m['N']}", str(m['N']), f"{m['sigma_t_s']}s", m['linear_regime'],
+            f"{m['bias_mean']:.4f}", f"{m['bias_median']:.4f}", f"{m['chi2_dof']:.2f}"
+        ])
+
+    t = Table(table_data, colWidths=[90, 40, 70, 80, 80, 80, 80])
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2b6cb0')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,-1), 9),
+        ('BOTTOMPADDING', (0,0), (-1,0), 6),
+        ('BACKGROUND', (0,1), (-1,-1), colors.HexColor('#f7fafc')),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#e2e8f0')),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 15))
+
+    # Gráfico Incorporado
+    story.append(Paragraph("Visualização de Dados (Distribuição Estatística)", h2_style))
+    story.append(Image(chart_path, width=420, height=210))
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("<i>Nota: O gráfico acima ilustra visualmente a convergência e dispersão dos estimadores calculados no pipeline.</i>", body_style))
+
+    # Construção do PDF
+    doc.build(story)
+    print(f"Sucesso: Relatório PDF salvo como '{pdf_filename}'")
+
+# ===========================================================================
+# 5. ORQUESTRADOR PRINCIPAL (EXECUÇÃO DO PIPELINE)
+# ===========================================================================
+if __name__ == "__main__":
+    print("Iniciando Pipeline de Análise Estatística Psi_Echo...")
+    
+    # Cenários de teste para avaliar a robustez
+    scenarios = [
+        {"N": 10, "sigma_t": 1.0, "theta": 0.0},
+        {"N": 50, "sigma_t": 1.0, "theta": 0.0},
+        {"N": 50, "sigma_t": 10.0, "theta": 0.0},
+        {"N": 50, "sigma_t": 100.0, "theta": 0.0}
+    ]
+    
+    metrics_summary = []
+    last_df = None
+    
+    for i, sc in enumerate(scenarios):
+        # 1. Simulação (Geração de Dados Sintéticos)
+        df_sim = simulate_data(sc["N"], sc["sigma_t"], sc["theta"], seed=42+i)
+        
+        # 2. Avaliação Estatística (Cálculo de Métricas e Bootstrap)
+        metrics = evaluate_metrics(df_sim, sc["sigma_t"], sc["theta"], seed=1042+i)
+        metrics_summary.append(metrics)
+        
+        # Guardar o cenário representativo para gerar o gráfico
+        if sc["N"] == 50 and sc["sigma_t"] == 1.0:
+            last_df = df_sim
+
+    # 3. Geração do Artefato Visual
+    chart_output = "pipeline_chart.png"
+    generate_pipeline_chart(last_df, filename=chart_output)
+
+    # 4. Geração do Relatório PDF Final
+    generate_pdf_report(metrics_summary, chart_output)
